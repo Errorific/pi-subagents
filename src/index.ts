@@ -39,7 +39,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTombstone, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -713,9 +713,12 @@ export default function (pi: ExtensionAPI) {
     // be a path-traversal primitive.
     delete safeOptions.rootSessionId;
     // Worse than rootSessionId: this one names a file to OPEN and replay as a
-    // conversation. Only the mention dispatcher may set it, and only from a
+    // conversation. Only the resurrection path may set it, and only from a
     // path this extension itself recorded — never from anything a caller sent.
     delete safeOptions.resumeSessionFile;
+    // Record identity is reclaimed with the persisted conversation. Letting a
+    // caller choose it would overwrite or impersonate another manager record.
+    delete safeOptions.agentId;
     // Bypasses handle allocation, so a forged value would duplicate a live
     // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
     delete safeOptions.reclaim;
@@ -960,69 +963,22 @@ export default function (pi: ExtensionAPI) {
       // `no_transcript`.
     }
 
-    // Evicted, but its conversation is still on disk: reopen it. This is an
-    // ordinary spawn carrying a session file, so the new record picks up the
-    // widget, fleet row, transcript and completion notification unchanged —
-    // and `reclaim` hands it back the names the tombstone was holding.
+    // Evicted, but its conversation is still on disk: reopen it under the
+    // original ID and handles. Keeping the identity stable makes the same ID a
+    // durable resume key across repeated cleanup/resurrection cycles.
     if (resolved?.kind === "tombstone") {
       const entry = resolved.entry;
       const target = `@${entry.alias ?? entry.handle}`;
-
-      // Checked here rather than left to SessionManager.open: that runs inside
-      // runAgent, whose rejection lands on the record as an agent error, not in
-      // the catch below. A `/new` in another pi window or a manual delete makes
-      // the conversation unrecoverable (Claude Code's `not_reachable`), so drop
-      // the entry — a row that can only ever fail is worse than none — and say
-      // so rather than quietly sending this message to an unrelated agent.
-      if (!existsSync(entry.sessionFile)) {
-        manager.dropTombstone(entry.handle);
-        ctx.ui.notify(`Could not resume ${target} — its session is gone.`, "warning");
-        return { action: "handled" };
-      }
-
-      // The Agent tool deliberately falls back to general-purpose for a type it
-      // cannot resolve (#183), which covers a deleted file AND a merely
-      // disabled one. A resume must not inherit that: reopening this
-      // conversation under a different agent's prompt and tools is not
-      // continuing it, and the new record would re-tombstone under the
-      // substitute, so the handle would never find its way back.
-      reloadCustomAgents();
-      const dispatch = resolveSpawnType(entry.type);
-      if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
-        // The tombstone stays: re-enabling the agent makes the handle work
-        // again, which a drop would foreclose.
-        ctx.ui.notify(`Could not resume ${target} — the ${entry.type} agent is no longer available.`, "warning");
-        return { action: "handled" };
-      }
-
-      try {
-        // spawnResolved, not spawnTopLevel: the latter strips
-        // `resumeSessionFile` and `reclaim` as untrusted. This path is the
-        // exception — both come from a tombstone this extension wrote.
-        const id = spawnResolved(pi, ctx, dispatch.type, mention.message, {
-          description: entry.description,
-          reclaim: { handle: entry.handle, alias: entry.alias },
-          resumeSessionFile: entry.sessionFile,
-          isBackground: true,
-        });
-        // The agent may still be starting — wait, so a startup failure lands in
-        // the catch below instead of being announced as a resume.
-        await manager.awaitStartup(id);
-        // The tombstone deliberately stays. `resolveMention` prefers the live
-        // record holding these same names, so it cannot shadow the resume — and
-        // if this run dies before establishing its own session, the original
-        // transcript is still the right thing for the next mention to reopen.
-        // Once the resumed record is evicted it overwrites this entry in place,
-        // keyed by the same handle, so nothing accumulates.
-        ctx.ui.notify(`Resuming ${target}`, "info");
-      } catch (err) {
-        // The type is already settled above, so what is left is a spawn-time
-        // failure: a strict worktree-isolation error, an unusable cwd.
-        ctx.ui.notify(
-          `Could not resume ${target}: ${err instanceof Error ? err.message : String(err)}`,
-          "warning",
-        );
-      }
+      const config = getAgentConfig(entry.type);
+      const resumed = await resumeTombstone(ctx, entry, mention.message, {
+        isBackground: true,
+        outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+        maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+      });
+      ctx.ui.notify(
+        resumed.ok ? `Resuming ${target}` : `Could not resume ${target} — ${resumed.message}.`,
+        resumed.ok ? "info" : "warning",
+      );
       return { action: "handled" };
     }
 
@@ -1368,6 +1324,120 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  type TombstoneResumeResult =
+    | { ok: true; record: AgentRecord }
+    | { ok: false; reason: "session-gone" | "type-unavailable" | "start-failed"; message: string };
+
+  /** Reopen an evicted agent's persisted conversation under its original identity. */
+  async function resumeTombstone(
+    ctx: ExtensionContext,
+    entry: AgentTombstone,
+    prompt: string,
+    options: {
+      isBackground: boolean;
+      outputTranscript: boolean;
+      maxTurns?: number;
+      toolCallId?: string;
+      signal?: AbortSignal;
+      emitCreated?: boolean;
+    },
+  ): Promise<TombstoneResumeResult> {
+    if (!existsSync(entry.sessionFile)) {
+      manager.dropTombstone(entry.handle);
+      return { ok: false, reason: "session-gone", message: "its session is gone" };
+    }
+
+    // Reopening under a fallback type would change the prompt and tools while
+    // claiming to continue the same conversation. The tombstone stays when the
+    // type is merely disabled, so re-enabling it makes the ID work again.
+    reloadCustomAgents();
+    const dispatch = resolveSpawnType(entry.type);
+    if (!dispatch.ok || dispatch.fellBackFrom !== undefined) {
+      return {
+        ok: false,
+        reason: "type-unavailable",
+        message: `the ${entry.type} agent is no longer available`,
+      };
+    }
+
+    const { state, callbacks } = createActivityTracker(options.maxTurns);
+    let id = entry.id;
+    const onSessionCreated = callbacks.onSessionCreated;
+    callbacks.onSessionCreated = (session: AgentRecord["session"]) => {
+      onSessionCreated(session);
+      const record = manager.getRecord(id);
+      if (!record || !session || !options.outputTranscript) return;
+      record.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
+      ensureOutputFile(record.outputFile);
+      record.outputCleanup = streamToOutputFile(session, record.outputFile, id, ctx.cwd, session.messages.length);
+    };
+
+    const spawnOptions = {
+      description: entry.description,
+      agentId: entry.id,
+      reclaim: { handle: entry.handle, alias: entry.alias },
+      resumeSessionFile: entry.sessionFile,
+      maxTurns: options.maxTurns,
+      signal: options.signal,
+      ...callbacks,
+    };
+
+    try {
+      let record: AgentRecord;
+      if (options.isBackground) {
+        id = manager.spawn(pi, ctx, dispatch.type, prompt, {
+          ...spawnOptions,
+          isBackground: true,
+        });
+        record = manager.getRecord(id)!;
+        record.toolCallId = options.toolCallId;
+        const joinMode = resolveJoinMode(defaultJoinMode, true);
+        if (joinMode) record.joinMode = joinMode;
+        await manager.awaitStartup(id);
+
+        if (joinMode != null && joinMode !== "async") {
+          currentBatchAgents.push({ id, joinMode });
+          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
+        }
+        if (options.emitCreated) {
+          pi.events.emit("subagents:created", {
+            id,
+            type: record.type,
+            description: record.description,
+            isBackground: true,
+          });
+        }
+      } else {
+        // A live foreground resume is not charged to the foreground spawn pool;
+        // reopening the same conversation after cleanup must keep that contract.
+        id = manager.spawn(pi, ctx, dispatch.type, prompt, {
+          ...spawnOptions,
+          isBackground: false,
+        });
+        record = manager.getRecord(id)!;
+        await manager.awaitStartup(id);
+        if (record.promise) await record.promise;
+      }
+
+      if (options.isBackground) {
+        agentActivity.set(id, state);
+        widget.markRunning(id);
+        widget.ensureTimer();
+        widget.update();
+        fleet.ensureTimer();
+        fleet.update();
+      }
+      return { ok: true, record };
+    } catch (err) {
+      return {
+        ok: false,
+        reason: "start-failed",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
   /**
    * Launch a detached resume of an existing agent and wire everything a
    * re-running agent needs: transcript anchoring, activity tracking, join-mode
@@ -1596,7 +1666,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
+- resume continues a previous agent by ID, reopening its persisted session after cleanup when available; steer_subagent messages a running one.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1620,7 +1690,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
+- Use resume with an agent ID to continue a previous agent's work. A cleaned-up agent is reopened from its persisted session when available. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
@@ -1743,7 +1813,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       resume: Type.Optional(
         Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
+          description: "Optional agent ID to resume from. Continues from previous context, reopening a persisted session after its in-memory record is cleaned up. Resumes detached like any other spawn; pass run_in_background: false to block and get the result inline. An agent can only be resumed once its current run has finished — use steer_subagent to reach one mid-run.",
         }),
       ),
       isolated: Type.Optional(
@@ -2089,7 +2159,47 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resume existing agent
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
+        let existing = manager.getRecord(params.resume);
+        if (!existing) {
+          const resolved = manager.resolveMention(params.resume);
+          if (resolved?.kind === "tombstone" && resolved.entry.id === params.resume) {
+            const config = getAgentConfig(resolved.entry.type);
+            const restored = await resumeTombstone(ctx, resolved.entry, params.prompt, {
+              isBackground: runInBackground,
+              outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
+              maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
+              toolCallId: runInBackground ? toolCallId : undefined,
+              signal: runInBackground ? undefined : signal,
+              emitCreated: runInBackground,
+            });
+            if (!restored.ok) {
+              return textResult(`Could not resume agent "${params.resume}": ${restored.message}.`);
+            }
+            existing = restored.record;
+
+            if (runInBackground) {
+              const isQueued = existing.status === "queued";
+              return textResult(
+                `Agent ${isQueued ? "queued" : "resumed"} in background.\n` +
+                `Agent ID: ${existing.id}\n` +
+                `Type: ${existing.type}\n` +
+                (existing.outputFile ? `Output file: ${existing.outputFile}\n` : "") +
+                (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+                `\nYou will be notified when this agent completes.\n` +
+                `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+                { ...detailBaseFor(existing), toolUses: existing.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: existing.id },
+              );
+            }
+
+            if (existing.status === "error") {
+              return textResult(`Agent failed: ${existing.error}${partialOutputSuffix(existing)}`, buildDetails(detailBaseFor(existing), existing));
+            }
+            return textResult(
+              existing.result?.trim() || "No output.",
+              buildDetails(detailBaseFor(existing), existing),
+            );
+          }
+        }
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }

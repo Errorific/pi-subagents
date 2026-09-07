@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Agent({ resume: "<id>" })` reopens persisted sessions after record cleanup.** Completed agent records are evicted from memory after roughly ten minutes, so ID-based resume stopped working even though the same persisted conversation remained reachable through its `@handle` tombstone. Resume now restores that conversation under its original ID and handles, for both background and foreground calls; it remains session-scoped and still requires `rememberAgents` or per-agent `persist_session`.
+
 ## [0.22.0] - 2026-10-13
 
 > **⚠️ Possibly breaking — background completion delivery changed ([#388](https://github.com/tintinweb/pi-subagents/pull/388)):**

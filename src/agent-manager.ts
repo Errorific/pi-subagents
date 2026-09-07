@@ -167,6 +167,12 @@ interface SpawnArgs {
 interface SpawnOptions {
   description: string;
   /**
+   * Identity of a persisted conversation being reopened. Internal capability:
+   * ordinary callers must not choose record IDs because every manager map,
+   * queue, event, and transcript uses this value as the agent's identity.
+   */
+  agentId?: string;
+  /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
    * anything unusable degrades via `handleBase` rather than failing the spawn.
@@ -383,10 +389,10 @@ export class AgentManager {
   private startups = new Map<string, Promise<void>>();
 
   /**
-   * Evicted agents that can still be reached by name, keyed by handle. Outlives
-   * the 10-minute record cleanup — that timer exists to bound memory, not to
-   * expire a conversation the user might still want — and is cleared alongside
-   * completed records on session start/switch.
+   * Evicted agents that can still be resumed by ID or reached by name, keyed by
+   * handle. Outlives the 10-minute record cleanup — that timer exists to bound
+   * memory, not to expire a conversation the user might still want — and is
+   * cleared alongside completed records on session start/switch.
    */
   private tombstones = new Map<string, AgentTombstone>();
 
@@ -496,7 +502,10 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
-    const id = randomUUID().slice(0, 17);
+    const id = options.agentId ?? randomUUID().slice(0, 17);
+    if (this.agents.has(id)) {
+      throw new Error(`Agent "${id}" already exists.`);
+    }
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,

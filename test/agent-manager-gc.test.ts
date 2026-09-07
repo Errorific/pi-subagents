@@ -196,6 +196,15 @@ describe("AgentManager — tombstones outliving the GC", () => {
     });
   });
 
+  it("keeps an evicted agent reachable by its original id", async () => {
+    manager = new AgentManager();
+    const { id } = await evictable("Explore", "audit the RPC path", "/sessions/explore.jsonl");
+
+    await vi.advanceTimersByTimeAsync(TICK);
+
+    expect(manager.resolveMention(id)).toMatchObject({ kind: "tombstone", entry: { id } });
+  });
+
   it("leaves nothing behind when the session was only ever in memory", async () => {
     // Without a file there is no conversation to reopen, so promising a resume
     // would be a lie — the mention has to fall through to starting a new agent.
@@ -251,7 +260,7 @@ describe("AgentManager — tombstones outliving the GC", () => {
     expect(manager.resolveMention("explore-101")?.kind).toBe("tombstone");
   });
 
-  it("hands a reclaimed name straight back, numbering nothing", async () => {
+  it("hands a reclaimed id and names straight back", async () => {
     // The resume path's whole contract: `handleBase(type)` cannot reproduce a
     // numbered handle, so the spawn takes the tombstone's names verbatim.
     manager = new AgentManager();
@@ -262,10 +271,12 @@ describe("AgentManager — tombstones outliving the GC", () => {
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
     const id = manager.spawn(mockPi, mockCtx, "Explore", "resumed", {
       description: "first",
+      agentId: "original-id",
       isBackground: true,
       reclaim: { handle: "explore", alias: "auth-audit" },
     } as any);
 
+    expect(id).toBe("original-id");
     expect(manager.getRecord(id)).toMatchObject({ handle: "explore", alias: "auth-audit" });
   });
 

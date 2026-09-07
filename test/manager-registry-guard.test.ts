@@ -11,7 +11,7 @@
  * The fix: the first activation claims the slot, later activations leave it
  * alone, and only the owner's shutdown releases it.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -20,6 +20,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { type Hermetic, hermeticDir } from "./helpers/boot-extension.js";
 
 const MANAGER_KEY = Symbol.for("pi-subagents:manager");
 
@@ -70,12 +71,15 @@ async function spawnBackground(tools: Map<string, any>): Promise<string> {
   return /Agent ID: (\S+)/.exec(textOf(r))![1];
 }
 
-// Restore the global slot around every test.
+// Restore the global slot and process paths around every test.
 const priorGlobal = (globalThis as any)[MANAGER_KEY];
+let hermetic: Hermetic;
+beforeEach(() => { hermetic = hermeticDir(); });
 afterEach(() => {
   if (priorGlobal === undefined) delete (globalThis as any)[MANAGER_KEY];
   else (globalThis as any)[MANAGER_KEY] = priorGlobal;
   vi.mocked(runAgent).mockReset();
+  hermetic.restore();
 });
 
 describe("Symbol.for manager registry across activations", () => {
@@ -146,6 +150,14 @@ describe("the registry spawn strips internal capabilities", () => {
 
     expect(entry.getRecord(id).rootSessionId).toBeUndefined();
     expect(runOpts().configCwd).toBeUndefined();
+    await root.lifecycle.get("session_shutdown")?.();
+  });
+
+  it("refuses a forged agent id and allocates one normally", async () => {
+    const { entry, id, root } = forge({ agentId: "victim-agent-id" });
+
+    expect(id).not.toBe("victim-agent-id");
+    expect(entry.getRecord("victim-agent-id")).toBeUndefined();
     await root.lifecycle.get("session_shutdown")?.();
   });
 
