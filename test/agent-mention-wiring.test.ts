@@ -1050,12 +1050,106 @@ describe("resuming an evicted agent by name", () => {
     expect(uiCtx.ui.notify).toHaveBeenCalledWith("Resuming @explore", "info");
   });
 
-  it("hands the resumed agent the handle back instead of numbering it", async () => {
+  it("resumes a cleaned-up agent by id in the background", async () => {
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    const manager = await evict(id);
+    vi.mocked(runAgent).mockClear();
+    heldRun(fakeSession());
+
+    const result = await tools.get("Agent").execute(
+      "tc-resume",
+      { prompt: "continue the review", description: "continue review", subagent_type: "Explore", resume: id, run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    await flush();
+
+    expect(textOf(result)).toContain(`Agent ID: ${id}`);
+    expect(manager.getRecord(id)).toMatchObject({ id, status: "running", handle: "explore" });
+    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
+      expect.anything(), "Explore", "continue the review",
+      expect.objectContaining({ agentId: id, resumeSessionFile: sessionPath() }),
+    );
+
+    const duplicate = await tools.get("Agent").execute(
+      "tc-resume-again",
+      { prompt: "continue again", description: "continue review", subagent_type: "Explore", resume: id, run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    expect(textOf(duplicate)).toContain("is still running");
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes a cleaned-up agent by id in the foreground", async () => {
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    const manager = await evict(id);
+    vi.mocked(runAgent).mockClear();
+    finishedRun(fakeSession());
+
+    const result = await tools.get("Agent").execute(
+      "tc-resume",
+      { prompt: "continue the review", description: "continue review", subagent_type: "Explore", resume: id, run_in_background: false },
+      undefined, undefined, ctx(),
+    );
+
+    expect(textOf(result)).toContain("first answer");
+    expect(manager.getRecord(id)).toMatchObject({
+      id,
+      status: "completed",
+      handle: "explore",
+      isBackground: false,
+    });
+    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
+      expect.anything(), "Explore", "continue the review",
+      expect.objectContaining({ agentId: id, resumeSessionFile: sessionPath() }),
+    );
+
+    await evict(id);
+    vi.mocked(runAgent).mockClear();
+    heldRun(fakeSession());
+    const repeated = await tools.get("Agent").execute(
+      "tc-resume-again",
+      { prompt: "one more pass", description: "continue review", subagent_type: "Explore", resume: id, run_in_background: true },
+      undefined, undefined, ctx(),
+    );
+    expect(textOf(repeated)).toContain(`Agent ID: ${id}`);
+    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
+      expect.anything(), "Explore", "one more pass",
+      expect.objectContaining({ agentId: id, resumeSessionFile: sessionPath() }),
+    );
+  });
+
+  it("reports a missing persisted session when resuming by id", async () => {
+    const { tools } = boot();
+    finishedRun(fakeSession());
+    const id = await spawnBackground(tools);
+    await flush();
+    await evict(id);
+    unlinkSync(sessionPath());
+    vi.mocked(runAgent).mockClear();
+
+    const result = await tools.get("Agent").execute(
+      "tc-resume",
+      { prompt: "continue", description: "continue review", subagent_type: "Explore", resume: id },
+      undefined, undefined, ctx(),
+    );
+
+    expect(textOf(result)).toContain("its session is gone");
+    expect(vi.mocked(runAgent)).not.toHaveBeenCalled();
+  });
+
+  it("hands the resumed agent its id and handle back instead of numbering it", async () => {
     // Otherwise the resume lands on `@explore-2` and the tombstone keeps
     // `@explore`, so the name the user just typed still points at the corpse.
     const { lifecycle, tools } = boot();
     finishedRun(fakeSession());
-    await evict(await spawnBackground(tools));
+    const originalId = await spawnBackground(tools);
+    await evict(originalId);
     await flush();
     vi.mocked(runAgent).mockClear();
     heldRun(fakeSession());
@@ -1065,6 +1159,7 @@ describe("resuming an evicted agent by name", () => {
 
     const manager = (globalThis as any)[Symbol.for("pi-subagents:manager")];
     const resumedId = (vi.mocked(runAgent).mock.calls[0][3] as any).agentId;
+    expect(resumedId).toBe(originalId);
     expect(manager.getRecord(resumedId).handle).toBe("explore");
   });
 

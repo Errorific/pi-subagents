@@ -134,9 +134,10 @@ export type ViewerMarkdownMode = 'off' | 'assistant' | 'all';
 export type AgentMentionMode = 'model' | 'direct' | 'off';
 
 /**
- * What survives a record's eviction so `@handle` keeps working. The live record
- * is discarded after ~10 minutes, but the pi session it wrote is still on disk,
- * and this is the little that is needed to find and describe it again.
+ * What survives a record's eviction so its ID and `@handle` can reopen it. The
+ * live record is discarded after ~10 minutes, but the pi session it wrote is
+ * still on disk, and this is the little that is needed to find and describe it
+ * again.
  */
 export interface AgentTombstone {
   handle: string;
@@ -233,8 +234,8 @@ export interface AgentRecord {
   outputFile?: string;
   /**
    * The agent's pi session file, when it was persisted (`persist_session`, or
-   * the `rememberAgents` default). Captured so a mention can reopen the
-   * conversation after the record itself has been evicted; undefined for an
+   * the `rememberAgents` default). Captured so a resume or mention can reopen
+   * the conversation after the record itself has been evicted; undefined for an
    * in-memory session, which leaves nothing to reopen.
    */
   sessionFile?: string;
