@@ -1395,11 +1395,8 @@ export default function (pi: ExtensionAPI) {
         if (joinMode) record.joinMode = joinMode;
         await manager.awaitStartup(id);
 
-        if (joinMode != null && joinMode !== "async") {
-          currentBatchAgents.push({ id, joinMode });
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
+        // Only a resume from an Agent call belongs to that call's turn.
+        if (options.toolCallId !== undefined) joinTurnGroup(id, joinMode);
         if (options.emitCreated) {
           pi.events.emit("subagents:created", {
             id,
